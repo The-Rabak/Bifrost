@@ -1,0 +1,80 @@
+x-app: &app
+  build: .
+  restart: unless-stopped
+  stop_grace_period: 220s
+  networks: [internal]
+  depends_on:
+    db:
+      condition: service_healthy
+    broker:
+      condition: service_healthy
+x-broker-env: &broker-env
+  BROKER_URL: amqp://${BROKER_USER:?set BROKER_USER}:${BROKER_PASSWORD:?set BROKER_PASSWORD}@broker/
+  TEST_MODE: ${TEST_MODE:-false}
+  TIME_SCALE: ${TIME_SCALE:-1}
+  RETRY_BASE: ${RETRY_BASE:-30}
+services:
+  db:
+    image: postgres:16.10-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER:?set DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
+      POSTGRES_DB: bifrost
+    volumes: [pg-data:/var/lib/postgresql/data]
+    networks: [internal]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d bifrost']
+      interval: 2s
+      timeout: 3s
+      retries: 40
+  broker:
+    image: rabbitmq:4.3.0-management-alpine
+    user: rabbitmq
+    hostname: broker
+    environment:
+      RABBITMQ_DEFAULT_USER: ${BROKER_USER:?set BROKER_USER}
+      RABBITMQ_DEFAULT_PASS: ${BROKER_PASSWORD:?set BROKER_PASSWORD}
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: '+S 2:2 +A 4'
+      RABBITMQ_CTL_ERL_ARGS: '+S 1:1 +A 1'
+    volumes: [rabbit-data:/var/lib/rabbitmq]
+    networks: [internal]
+    healthcheck:
+      test: [CMD, nc, -z, -w, '2', 127.0.0.1, '5672']
+      interval: 3s
+      timeout: 3s
+      retries: 40
+  api:
+    <<: *app
+    networks: [internal, edge]
+    environment:
+      <<: *broker-env
+      DATABASE_URL: postgresql://${DB_USER}:${DB_PASSWORD}@db/bifrost
+      API_TOKEN: ${API_TOKEN:?set API_TOKEN}
+      MANAGEMENT_URL: http://broker:15672
+      BROKER_USER: ${BROKER_USER}
+      BROKER_PASSWORD: ${BROKER_PASSWORD}
+      TICK_SECONDS: ${TICK_SECONDS:-2}
+      RECOVERY_SECONDS: ${RECOVERY_SECONDS:-10}
+      REAPER_SECONDS: ${REAPER_SECONDS:-10}
+      RECOVERY_ALLOWANCE: ${RECOVERY_ALLOWANCE:-5}
+      CLEANUP_SECONDS: ${CLEANUP_SECONDS:-3600}
+      SUBMIT_LIMIT: ${SUBMIT_LIMIT:-120}
+      RETRY_LIMIT: ${RETRY_LIMIT:-30}
+    ports: ['127.0.0.1:${API_PORT:-8000}:8000']
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=4)"]
+      interval: 2s
+      timeout: 5s
+      retries: 40
+  worker:
+    <<: *app
+    environment:
+      <<: *broker-env
+    command: [python, -m, bifrost.worker]
+volumes:
+  pg-data:
+  rabbit-data:
+networks:
+  edge:
+  internal:
+    internal: true

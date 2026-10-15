@@ -1,6 +1,6 @@
 # Specification: Distributed Job Queue Service
 
-Status: Draft with binding engineering and Docker E2E requirements; not yet published to an issue tracker. Implementation and verification are pending.
+Status: Implemented and verified against the complete deployed Docker E2E suite; not yet published to an issue tracker. See [execution evidence](docs/implementation.md) for the tested source and concrete execution decisions. Planning wording below records the approved specification.
 
 ## Problem Statement
 

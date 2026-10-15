@@ -1,0 +1,7 @@
+# Used only by the isolated E2E runner, for real broker observation/injection from the host.
+services:
+  broker:
+    networks: [internal, edge]
+    ports: ['127.0.0.1::5672', '127.0.0.1::15672']
+    environment:
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: '+S 2:2 +A 4 -rabbit collect_statistics_interval 1000'

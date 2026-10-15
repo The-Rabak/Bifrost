@@ -1,6 +1,6 @@
 # Design Decisions
 
-Agreed design for the assignment; implementation and verification are pending. [prd.md](prd.md) defines behavior and acceptance criteria. This document records the choices and their costs.
+Agreed design for the assignment, now implemented and verified against the Docker E2E suite. [prd.md](prd.md) defines behavior and acceptance criteria. This document records the choices and their costs; [execution evidence](docs/implementation.md) records the implemented details and verification.
 
 ## 1. Job Pickup Strategy
 
