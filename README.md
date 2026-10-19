@@ -23,15 +23,22 @@ Durable messages, confirmed publication, guarded state transitions, and timeout 
 
 ## Quick start
 
-Requires Docker with Compose v2 and Python 3.
+Requires Make, Docker with Compose v2, and Python 3.
 
 ```sh
-python3 scripts/configure.py
-docker compose up -d --build --wait
+make up
 curl http://localhost:8000/health
 ```
 
-The setup script generates `.env` with local credentials. The API is available at `http://localhost:8000`, with interactive API documentation at `/docs`. Job endpoints require the bearer token from `.env`.
+`make up` generates `.env` with local credentials if needed, builds and starts all services, and waits for readiness. The API is available at `http://localhost:8000`, with interactive API documentation at `/docs`. Job endpoints require the bearer token from `.env`.
+
+To stop the local deployment:
+
+```sh
+make down
+```
+
+Persisted data is kept, ready for the next `make up`.
 
 ## Submit a job
 
@@ -70,16 +77,20 @@ docker compose up -d --scale worker=3
 docker compose logs -f api worker
 ```
 
-Services emit structured JSON logs. `/health` reports dependency connectivity, job counts, queue depth, and worker consumers. Data persists in named volumes across restarts and `docker compose down`.
+Services emit structured JSON logs. `/health` reports dependency connectivity, job counts, queue depth, and worker consumers. Data persists in named volumes across restarts and `make down`.
 
 ## Test
 
 With Python 3.12+ and [uv](https://docs.astral.sh/uv/) installed:
 
 ```sh
-uv run python scripts/e2e.py
+make test
 ```
 
-The suite builds an isolated Docker stack, tests the API and real dependencies—including concurrency, crashes, retries, and restart recovery—then collects diagnostics and removes its resources.
+`make test` runs every E2E test with per-test results and a final pass/fail summary in the terminal. Each run builds an isolated Docker stack, tests the API and real dependencies—including concurrency, crashes, retries, and restart recovery—then collects diagnostics and removes its own resources. The local deployment can keep running alongside it.
+
+JUnit results (`results.xml`), service logs (`stack.log`), and build details (`build.json`) are saved under `artifacts/bifrost-test-<run-id>/`. A failed test, startup, or cleanup makes the command exit with an error.
+
+Run `make` or `make help` for a command summary.
 
 See [design decisions](DECISIONS.md), [test coverage](docs/acceptance.md), [test results](docs/implementation.md), and [AI usage](AI_USAGE.md) for more detail. Configuration defaults live in [config.py](bifrost/config.py); deployment settings are in [compose.yaml](compose.yaml).
