@@ -5,3 +5,4 @@ __pycache__/
 .ruff_cache/
 artifacts/
 *.pyc
+/PY-Backend-Senior-job-queue-Kit-Assignment.pdf
