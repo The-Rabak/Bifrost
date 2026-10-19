@@ -1,29 +1,64 @@
-# AI usage
+# AI Usage
 
-The interview review exposed that dispatch-token guards alone allowed duplicate physical executions to report conflicting outcomes. The follow-up adds a small Redis adapter and execution service: expiring owner claims, compare-and-set outcome storage, and replay before broker acknowledgement. Workers retain no access to the API's Postgres and do not poll the API. Tests distinguish saved-outcome replay from the remaining effect-before-outcome crash window; Redis is not presented as exactly-once execution.
+I used Muse Spark for the initial product discussion and Codex for planning, implementation, testing, and review. In Codex, I used Matt Pocock's `grill-me`, `to-spec`, and `implement` skills at different stages.
 
-We used a mock interview to challenge the architecture against the original assignment and actual code. Codex played the assignment author, asked concrete failure-scenario questions, and evaluated the user's explanations against the implementation. The user recognized the architectural weak point while discussing two executions of the same dispatch reporting conflicting outcomes. Challenging that behavior led to the Redis execution-coordination change above. This made the interview useful for finding a design problem as well as assessing understanding of the code.
+## From the assignment to a PRD
 
-Inspired by that discovery, the user proposed a repeatable adversarial interview between an interviewer subagent and an interviewee subagent, coordinated by an independent orchestrator. The [saved next-session prompt](adverserial_interview_prompt.md) specifies exactly 10 question-and-answer rounds, GPT-6.1-SOL with high reasoning for all participants, independent code research, and no repository or infrastructure changes. The final report must preserve every question and answer and record only substantiated architectural issues worth considering for refactoring. Properly explained exercise constraints are valid defenses, and finding no refactoring candidates is acceptable. This subagent process has been prepared but has not yet been run; the discovery described above came from the human/AI mock interview.
+I started with a plain conversation in Muse Spark about my understanding of the assignment: what the system needed to do, what mattered for the interview, and how much architecture was appropriate for the exercise. We went back and forth on microservices practices, especially service boundaries, database ownership, asynchronous communication, and failure handling.
 
-Codex assisted with interpreting the supplied specification, selecting concrete contracts, writing the Python service and SQL, authoring deployed Docker acceptance tests, diagnosing failures, and reviewing the resulting changes. No implementation agents were delegated: the supplied AGENTS.md mapping requests sequential work in the main thread.
+That conversation became the first [PRD](prd.md). It gave me something concrete to question before asking an agent to write code.
 
-Useful contributions include keeping workers independent of the API's Postgres, separating logical attempts from physical executions, using guarded transactions with audit inserts, preserving terminal-before-start outcomes, isolating Compose projects, and using real broker/container failure boundaries rather than mocks.
+## Challenging the PRD and writing the spec
 
-Incorrect initial suggestions/implementations and corrections:
+I brought the PRD and original assignment PDF into Codex and used Matt Pocock's `grill-me` skill to question the decisions and find gaps. This helped turn vague expectations such as “prevent duplicates” and “recover crashed jobs” into specific guarantees, failure cases, and accepted limitations.
 
-- A broker `ping` health check only established Erlang liveness, allowing API startup before AMQP readiness. The final setup uses a cheap container TCP probe plus API HTTP readiness that checks the real AMQP connection and queue; connection startup/recovery remains explicit.
-- Running a RabbitMQ health check as root could create the Erlang cookie with the wrong owner during startup. The broker now runs as its own non-root user.
-- Giving the API only an internal Docker network prevented published HTTP access on this Docker installation. The API now also joins an edge network; dependencies retain only the internal network and no published ports.
-- Reconnecting status events can put a final outcome before its start. Assuming worker publication order alone solves this would lose valid results. Current-token outcomes now imply their missing start inside the same state/audit transaction.
-- A claim token does not provide exclusive execution: uncertain publication and worker redelivery can invoke a handler again. Documentation and fault tests distinguish those windows from ordinary competing-consumer delivery.
+I then used `to-spec` to turn the refined PRD into the [implementation specification](spec.md). The PDF stayed part of the context so the plan could be checked against the actual assignment. This stage clarified choices such as database ownership, the dispatch boundary, retry cycles, cancellation, and what the tests needed to prove.
 
-The implementation evidence records observed test results and remaining limitations. Generated test names, stable mock IDs, or passing static checks are not evidence of exactly-once execution.
+## Implementation in two rounds
 
-Concrete concurrency mistakes found during implementation were also corrected:
+I split the specification into two halves and used Matt Pocock's `implement` skill in Codex over two rounds. Each round covered its part of the spec through implementation and testing. The tests ran against deployed Docker services with real Postgres and RabbitMQ so they could exercise actual transactions and message delivery.
 
-- Treating an advisory lock around repeated startup DDL as sufficient for live replica startup overlooked lock conflicts with the already-running cleaner. Initial DDL now commits atomically once; later replicas detect the committed schema and avoid DDL locks.
-- A crash test initially assumed RabbitMQ redelivery would beat reaping. The accepted contract allows either recovery mechanism to win. The redelivery-specific scenarios now pause the real reaper poll before database acquisition, preserving their strict one-token assertions; separate deployed tests exercise reaping, continuing progress, abandoned tokens, and completion races.
-- Global pause hooks could stop a stale queued delivery from a previous scenario instead of the intended job. A subsequent two-second scheduling window still raced with slow Docker control calls. Fault tests now self-arm job-specific pauses from validated immutable test controls; no external installation deadline is needed.
-- Looking up an existing idempotency key after `ON CONFLICT DO NOTHING` could race with old-key cleanup. The lookup now takes a key-share lock and retries insertion if the eligible old key was released between statements.
-- Follow-up review exposed NUL strings that PostgreSQL cannot persist, JSON nesting accepted by HTTP but rejected inside the worker envelope, scheduler reservations continuing during shutdown, and diagnostic failures bypassing test-stack teardown. Shared validation and the existing shutdown/cleanup paths now handle these cases, with deployed regressions and four focused host-runner fault checks. The Docker rerun also exposed a failover test polling consumer removal before the sampled active flag had updated; its bounded poll now waits for both required conditions.
+Implementation ran in the main thread, following the repository's tool mapping. The later adversarial interviews used a separate process with explicit subagent roles.
+
+## Review, simplify, test, and fix
+
+After implementation, I ran multiple regular Codex sessions with review prompts. These asked it to look for bugs, check the code against the assignment and spec, simplify unnecessary code, strengthen tests, and fix what it found. Reviews checked the code and traced what happened at each failure point.
+
+This took several passes. Fixes included startup locking, idempotency-key cleanup races, status-event ordering, invalid JSON handling, shutdown behavior, and test-runner cleanup. Some failures came from the test harness itself, so those needed diagnosis too. [docs/implementation.md](docs/implementation.md) records failed runs, corrections, and the later passing runs.
+
+## Mock interview
+
+I used Codex as the assignment author in a mock interview. It asked concrete “what if” questions and checked my explanations against the implementation. The aim was to make sure I could explain the code and defend the tradeoffs myself.
+
+While discussing two executions of the same dispatch reporting conflicting outcomes, I recognized that the dispatch token protected database state but did not select one physical executor. That led to the worker-owned Redis claims and saved-outcome replay described in [decision 18](DECISIONS.md#18-worker-owned-execution-claims-in-redis).
+
+The change reduced duplicate execution without giving workers access to the API's database or making them poll the API. It also left an explicit limit: a crash after an external effect but before saving the outcome can still cause that effect to repeat.
+
+## Adversarial interviews
+
+After that discovery, I used adversarial AI interviews to look for further architectural weaknesses. One agent played the interviewer, another defended the implementation, and an independent orchestrator checked disputed claims against the code. The [saved prompt](adverserial_interview_prompt.md) defines ten question-and-answer rounds, independent research, and a read-only review.
+
+The interviews found no major architectural issues. The agents checked proposed weaknesses against the code and allowed reasonable exercise constraints when the implementation supported the explanation.
+
+## What helped most
+
+AI was useful for turning the assignment into explicit contracts and for tracing failures across service boundaries. Two contributions mattered most: checking when messages could be acknowledged safely, and separating submission idempotency, logical attempts, physical execution, and external effects. Those distinctions shaped both the implementation and its tests.
+
+The mock interview was also useful beyond preparation. Explaining a concrete failure scenario exposed a design gap that earlier code reviews had missed.
+
+## What I had to fix
+
+AI suggestions and generated code needed correction, particularly around concurrency:
+
+- **Event order:** Publishing start before completion does not guarantee that the API applies them in that order after reconnects or replay. A final outcome for the current token now records its missing start and outcome in one transaction.
+- **Duplicate execution:** A token check in Postgres prevents stale state updates; it does not stop two workers running the same attempt. Redis claims and retained outcomes address that gap within their documented limits.
+- **Startup locking:** An advisory lock around schema creation did not prevent repeated DDL from conflicting with a running cleanup transaction. Later replicas now detect the committed initial schema and skip DDL.
+- **Idempotency cleanup:** Looking up a key after a conflicting insert could race with cleanup releasing the old key. The lookup now locks the existing row and retries insertion if cleanup won the race.
+- **Crash tests:** Early tests assumed broker redelivery would always beat the reaper. Both are valid recovery paths. Separate scenarios now test each mechanism, and job-specific pause points replaced timing-sensitive external hook installation.
+- **Readiness and teardown:** A broker liveness check did not prove AMQP readiness, and diagnostic failures could bypass test cleanup. Readiness now checks the actual dependency path, and teardown runs even if collecting diagnostics fails.
+
+## What AI struggled with
+
+AI was better at proposing individual mechanisms than checking how they interacted. Database locks, broker acknowledgements, Redis leases, and retry counters can each look correct in isolation while leaving a gap between them. Concrete timelines and failure tests were more useful than broad requests to “make it reliable.”
+
+It also needed repeated correction on what tests could establish. Stable mock IDs, clean audit logs, and passing tests do not prove exactly-once execution. The final design and documentation keep that distinction explicit.
