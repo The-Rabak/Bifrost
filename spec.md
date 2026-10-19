@@ -1,5 +1,7 @@
 # Specification: Distributed Job Queue Service
 
+Execution update (2026-10-20): worker-owned Redis claims and 24-hour saved outcomes supplement dispatch-token guards. The API retains exclusive access to Postgres; workers do not poll the API. A duplicate delivery waits on an active claim or replays the saved event. New logical attempts have new keys, so failed outcomes do not prevent business retries. A lease is the bounded handler timeout plus 15 seconds; saving checks the current owner atomically. Redis connection outages pause broker consumption. See [decision 18](DECISIONS.md#18-worker-owned-execution-claims-in-redis) for persistence, service boundaries, recovery, and remaining at-least-once effect limitations. This explicitly supersedes the original stateless-worker choice.
+
 Status: Implemented and verified against the complete deployed Docker E2E suite; not yet published to an issue tracker. See [execution evidence](docs/implementation.md) for the tested source and concrete execution decisions. Planning wording below records the approved specification.
 
 ## Problem Statement
@@ -12,7 +14,7 @@ The engineering assessment also needs demonstrable behavior when workers crash, 
 
 Provide a Python 3.11+ FastAPI service with Postgres 16 as its authoritative state store and RabbitMQ 4.3 for durable work distribution and status events. Clients use authenticated HTTP endpoints to submit, inspect, list, cancel, and retry jobs. Identical, independently running workers execute four asynchronous mock handlers: email, webhook, report, and batch.
 
-The API owns every database operation, including dispatch, status application, recovery, and audit history. Workers communicate through RabbitMQ and have no database access. A shared work queue distributes normal deliveries among workers; one active sequential status consumer applies execution events.
+The API owns every Postgres operation, including dispatch, status application, recovery, and audit history. Workers communicate through RabbitMQ and have no access to API Postgres; they own Redis execution claims and saved outcomes. A shared work queue distributes normal deliveries among workers; one active sequential status consumer applies execution events.
 
 The service offers automatic retries with backoff, one optional manual retry cycle, cancellation before dispatch, recovery of uncertain publication and abandoned processing, and durable ordinary restart behavior. Its execution guarantee is at least once with guarded persistent state. Documentation and tests explain the accepted duplicate-execution window and exercise-level operational limits.
 
@@ -115,7 +117,7 @@ Build this simply and effectively. SOLID and DRY are mandatory, expressed throug
 
 ## Implementation Decisions
 
-1. **Ownership and topology.** Build an HTTP API with API-hosted scheduler/publication recovery, status consumer, reaper, DLQ consumer, and cleaner, plus an independent shared worker service. All Postgres access belongs to the API side. Workers receive broker credentials but no database connection configuration and perform no HTTP execution-admission handshake.
+1. **Ownership and topology.** Build an HTTP API with API-hosted scheduler/publication recovery, status consumer, reaper, DLQ consumer, and cleaner, plus an independent shared worker service. All Postgres access belongs to the API side. Workers receive broker and worker-owned Redis configuration but no Postgres connection configuration and perform no HTTP execution-admission handshake.
 
 2. **Durable messaging.** Use one durable quorum work queue, `q.jobs`, a durable status queue, `q.job-status`, and one work dead-letter queue, `q.jobs.dlq`, reached through `dlx.jobs`. All workers consume the same work queue and support all four handlers. Enable Single Active Consumer for the status queue; use ordinary competing consumers for work. Persist work/status messages and use publisher confirmations.
 
@@ -214,7 +216,7 @@ These requirements are binding. The user's chosen success metric is comprehensiv
 - Real email delivery, outbound webhook requests, external report storage, or other real side effects.
 - Workflows, DAGs, cron scheduling, per-tenant isolation, user accounts, JWTs, or authorization scopes.
 - Cancellation after dispatch, broker-message deletion for cancellation, execution-admission RPCs, and worker access to Postgres.
-- Exactly-once execution/effects, absolute prevention of overlapping execution during failures, a general execution-deduplication service, a separate outbox subsystem, or an event store.
+- Exactly-once execution/effects, absolute prevention of overlapping execution during failures, a separate cross-service execution coordinator, a separate outbox subsystem, or an event store.
 - Per-type worker fleets/work queues, cross-type ordering promises, per-type capacity reservation, preemption, priority aging, fairness guarantees, and starvation prevention.
 - Heartbeat infrastructure, a separate infrastructure-retry framework, automated DLQ replay, or guaranteed lossless DLQ transfer.
 - Globally coordinated rate limiting, production identity/authorization, and per-service broker identities.
@@ -226,9 +228,9 @@ These requirements are binding. The user's chosen success metric is comprehensiv
 
 ## Further Notes
 
-- This specification synthesizes PRD version 1.1 in [prd.md](prd.md) and the agreed rationale in [DECISIONS.md](DECISIONS.md). It records the agreed design without claiming implementation or verification is complete. No separate glossary or ADR collection is present; terminology follows those two documents.
+- This specification synthesizes PRD version 1.2 in [prd.md](prd.md) and the agreed rationale in [DECISIONS.md](DECISIONS.md). It records the agreed design without claiming implementation or verification is complete. No separate glossary or ADR collection is present; terminology follows those two documents.
 - Preserve the distinctions between submission deduplication, logical attempts, broker redelivery, and physical execution. The dispatch token protects persistent state and attempt attribution, not exclusive physical execution.
-- The selected simplifications are intentional: database-free workers, three queues with distinct roles, job-row publication recovery, one active status consumer, bounded mock execution, and explicit failure tradeoffs. Execution planning should not add production subsystems to eliminate accepted limitations.
+- The selected simplifications are intentional: workers without API-database access, three queues with distinct roles, job-row publication recovery, one active status consumer, bounded mock execution, and explicit failure tradeoffs. Execution planning should not add production subsystems to eliminate accepted limitations.
 - The user's follow-up makes simplicity, SOLID, DRY, and tests-first delivery mandatory. Comprehensive adversarial E2E tests driven by deployed Docker services are the success metric. These explicit directions supersede the earlier proposed testing-seam review and any interpretation that a broad unit suite or live dependencies alone, without deployed application containers, would establish acceptance. Carry these constraints into every execution slice and its completion evidence.
 - The execution plan must settle the explicitly deferred choices, especially preservation of terminal outcomes before accepted starts, concrete message and input/error contracts, atomic publication-recovery reservation, fault-injection mechanics, delivery limits, test controls, and deployment/shutdown settings.
 - The required submission documentation comprises README setup/run/test/examples/scaling/architecture guidance, design decisions and limitations, and an AI-usage account including incorrect concurrency suggestions and corrections. With more time, the agreed improvement is handler-specific idempotency before introducing real external effects, including the gap between performing an effect and reporting completion.

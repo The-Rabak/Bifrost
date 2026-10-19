@@ -24,15 +24,6 @@ os.environ.update(
         "BROKER_PASSWORD": secrets.token_hex(16),
         "API_TOKEN": secrets.token_hex(24),
         "API_PORT": "0",
-        "TEST_MODE": "true",
-        "TIME_SCALE": ".02",
-        "RETRY_BASE": ".15",
-        "TICK_SECONDS": ".08",
-        "RECOVERY_SECONDS": "5",
-        "REAPER_SECONDS": ".1",
-        "RECOVERY_ALLOWANCE": "5",
-        "CLEANUP_SECONDS": ".2",
-        "SUBMIT_LIMIT": "10000",
     }
 )
 os.environ["ARTIFACT_DIR"] = str(root / "artifacts" / os.environ["COMPOSE_PROJECT_NAME"])
@@ -95,27 +86,32 @@ try:
         check=False,
     ).returncode
 finally:
-    output = subprocess.run(
-        [*command, "logs", "--no-color"], capture_output=True, text=True, timeout=30
-    )
-    logs = output.stdout + output.stderr
-    for key in ["DB_PASSWORD", "BROKER_PASSWORD", "API_TOKEN"]:
-        logs = logs.replace(os.environ[key], "[REDACTED]")
-    Path(os.environ["ARTIFACT_DIR"], "stack.log").write_text(logs)
-    report = artifacts / "results.xml"
-    if report.exists():
-        content = report.read_text()
+    try:
+        output = subprocess.run(
+            [*command, "logs", "--no-color"], capture_output=True, text=True, timeout=30
+        )
+        logs = output.stdout + output.stderr
         for key in ["DB_PASSWORD", "BROKER_PASSWORD", "API_TOKEN"]:
-            content = content.replace(os.environ[key], "[REDACTED]")
-        report.write_text(content)
-    cleanup = subprocess.run(
-        [*command, "down", "-v", "--remove-orphans", "--rmi", "local", "--timeout", "5"],
-        check=False,
-        timeout=60,
-    )
-    if cleanup.returncode and not result:
-        result = cleanup.returncode
-    manifest["exit_code"] = result
-    manifest["cleanup_exit_code"] = cleanup.returncode
-    artifacts.joinpath("build.json").write_text(json.dumps(manifest, indent=2) + "\n")
+            logs = logs.replace(os.environ[key], "[REDACTED]")
+        Path(os.environ["ARTIFACT_DIR"], "stack.log").write_text(logs)
+        report = artifacts / "results.xml"
+        if report.exists():
+            content = report.read_text()
+            for key in ["DB_PASSWORD", "BROKER_PASSWORD", "API_TOKEN"]:
+                content = content.replace(os.environ[key], "[REDACTED]")
+            report.write_text(content)
+    except Exception:
+        result = result or 1
+        raise
+    finally:
+        cleanup = subprocess.run(
+            [*command, "down", "-v", "--remove-orphans", "--rmi", "local", "--timeout", "5"],
+            check=False,
+            timeout=60,
+        )
+        if cleanup.returncode and not result:
+            result = cleanup.returncode
+        manifest["exit_code"] = result
+        manifest["cleanup_exit_code"] = cleanup.returncode
+        artifacts.joinpath("build.json").write_text(json.dumps(manifest, indent=2) + "\n")
 sys.exit(result)

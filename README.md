@@ -1,6 +1,6 @@
 # Bifrost
 
-A small distributed job queue: Python 3.12/FastAPI, Postgres 16, RabbitMQ 4.3, and independently scalable asynchronous workers. All handlers are mocks; none sends email, requests a webhook, or uploads a report.
+A small distributed job queue: Python 3.12/FastAPI, Postgres 16, RabbitMQ 4.3, Redis 7.4, and independently scalable asynchronous workers. All handlers are mocks; none sends email, requests a webhook, or uploads a report.
 
 ## Run
 
@@ -13,7 +13,7 @@ docker compose up -d --build --wait
 curl http://localhost:8000/health
 ```
 
-`configure.py` creates an ignored `.env` with random credentials and refuses to overwrite it. Alternatively fill `.env.example` and save it as `.env`. Only the API is published, bound to loopback. Postgres and RabbitMQ persist in named volumes. `docker compose down` retains them; `down -v` destroys this deployment's data.
+`configure.py` creates an ignored `.env` with random credentials and refuses to overwrite it. Alternatively fill `.env.example` and save it as `.env`. Only the API is published, bound to loopback. Postgres, RabbitMQ, and Redis persist in named volumes. `docker compose down` retains them; `down -v` destroys this deployment's data.
 
 Get the API token from your `.env` and export it in your terminal:
 
@@ -48,7 +48,7 @@ OpenAPI is at `/docs`. New submissions return 202; a repeated key returns 200 an
 | report | `{"parameters":{"period":"monthly"}}` | stable `file_url` under `reports.invalid` |
 | batch | `{"items":["a","b"]}` | `processed_count` and `summary` containing processed items |
 
-Payloads reject unknown fields and non-finite JSON numbers, and exceed neither 64 KiB serialized JSON nor 1,000 batch items. Empty batches return count zero and an empty summary. Priority is a strict integer 0–31, default 4; max_attempts is 1–5, default 3. Idempotency keys have 1–200 characters. Supplied schedules must contain a timezone; omitted or past times are immediately eligible. Listings default to 50 and accept 1–100 items with a nonnegative offset. Jobs sort newest first with UUID tie-breaking; audit logs sort oldest first with numeric ID tie-breaking.
+Payloads reject unknown fields, non-finite JSON numbers, and NUL characters in strings or object keys. They exceed neither 64 KiB serialized JSON, 64 nested object/array containers (including the payload object), nor 1,000 batch items. Status results share the JSON restrictions; failure text and idempotency keys also reject NUL. Empty batches return count zero and an empty summary. Priority is a strict integer 0–31, default 4; max_attempts is 1–5, default 3. Idempotency keys have 1–200 characters. Supplied schedules must contain a timezone; omitted or past times are immediately eligible. Listings default to 50 and accept 1–100 items with a nonnegative offset. Jobs sort newest first with UUID tie-breaking; audit logs sort oldest first with numeric ID tie-breaking.
 
 Cancellation is allowed only from pending/scheduled, including retry backoff. Once the reservation commits, dispatch wins even if publication has not completed. Scheduling and retry times always override priority.
 
@@ -62,19 +62,22 @@ flowchart LR
   API --> PG[(Postgres: jobs and audit)]
   API --> Work[q.jobs: quorum priority queue]
   Work --> Workers[Shared workers: prefetch 1]
+  Workers --> Redis[(Worker-owned Redis: claims and outcomes)]
   Workers --> Status[q.job-status: Single Active Consumer]
   Status --> API
   Work --> DLQ[q.jobs.dlq via dlx.jobs]
   DLQ --> API
 ```
 
-API-side scheduler, publication recovery, status application, reaper, dead-letter handling, and cleanup share guarded lifecycle transitions. Workers have broker credentials and **no database configuration**. A short Postgres transaction reserves due work with `FOR UPDATE SKIP LOCKED`, assigns its token, and commits before publication. The row's leased recovery time coordinates uncertain publications among API replicas. Confirmed backlog is left in RabbitMQ while workers are offline.
+API-side scheduler, publication recovery, status application, reaper, dead-letter handling, and cleanup share guarded lifecycle transitions. Workers have broker credentials and **no Postgres configuration**. A short Postgres transaction reserves due work with `FOR UPDATE SKIP LOCKED`, assigns its token, and commits before publication. The row's leased recovery time coordinates uncertain publications among API replicas. Confirmed backlog is left in RabbitMQ while workers are offline.
 
-Each worker confirms its processing event before execution, then its final event before acknowledging work. Business failures are acknowledged; the API decides retries. Status consumers use prefetch 1 and Single Active Consumer failover; acknowledgement follows the atomic state/audit commit. A current-token final outcome can atomically imply its missing start. Repeated starts do not count again. Ended tokens are invalidated; stale events, progress, and dead letters cannot reopen accepted outcomes. Progress never decreases within an attempt; success sets 100.
+Before execution, a worker atomically claims the logical attempt in Redis. Other deliveries wait on the claim or replay its saved outcome. Claims expire after the handler timeout plus 15 seconds; final outcomes are persisted before publication and retained for 24 hours. Redis uses AOF with fsync on every write and no eviction. It is on a worker-only internal network; the API has no Redis access. Workers never query Postgres or poll the API. `bifrost/execution_store.py` owns Redis operations and `bifrost/execution.py` owns claim/wait/execute/replay behavior. See [decision 18](DECISIONS.md#18-worker-owned-execution-claims-in-redis).
+
+Each owner confirms its processing event before execution, then its recorded final event before acknowledging work. Business failures are acknowledged; the API decides retries. Status consumers use prefetch 1 and Single Active Consumer failover; acknowledgement follows the atomic state/audit commit. A current-token final outcome can atomically imply its missing start. Repeated starts do not count again. Ended tokens are invalidated; stale events, progress, and dead letters cannot reopen accepted outcomes. Progress never decreases within an attempt; success sets 100.
 
 Timeouts are email/webhook 15 seconds, report 60, batch 180. A reaper uses the first accepted attempt start plus that timeout and a recovery allowance. Progress cannot extend this deadline. A lost worker may be redelivered with the same token, or its abandoned attempt may enter a new business retry.
 
-The guarantee is at least once with guarded persistent state. Uncertain broker acceptance, connection loss, and crashes before acknowledgement can repeat physical execution, possibly overlapping it. Tokens do not prevent side effects. Stable mock result IDs and unique audit entries do not prove physical execution happened once. There is no outbox, admission RPC, heartbeat protocol, lossless DLQ transfer, or automatic DLQ replay.
+The guarantee is at-least-once delivery with guarded persistent state and suppression of duplicate execution within a valid Redis lease or retained outcome. Lease/retention expiry, Redis data loss, and new business attempts can still repeat physical execution, possibly overlapping it. A crash after an external effect but before saving its outcome remains ambiguous; real handlers need receiver-side idempotency. Stable mock result IDs and unique audit entries do not prove physical execution happened once. There is no outbox, admission RPC, heartbeat protocol, lossless DLQ transfer, or automatic DLQ replay.
 
 RabbitMQ 4.3 provides [32 native strict quorum priorities](https://www.rabbitmq.com/docs/priority). Preference applies to eligible same-type work still awaiting dispatch/delivery; it does not preempt work already delivered. Redelivery ordering may differ. This single-node quorum deployment does not supply replicated high availability. See [DECISIONS.md](DECISIONS.md) and [implementation decisions](docs/implementation.md).
 
@@ -107,6 +110,7 @@ The exit code is nonzero on a failed test or failed deployment. Redacted logs an
 
 ```sh
 uv run python scripts/e2e.py tests/e2e/test_delivery.py
+uv run pytest tests/runner
 uv run ruff check bifrost tests scripts
 uv run ruff format --check bifrost tests scripts
 uv run ty check bifrost
@@ -114,11 +118,13 @@ uv run ty check bifrost
 
 On WSL, an optional `UV_PROJECT_ENVIRONMENT=/tmp/bifrost-venv` keeps dependency imports on the Linux filesystem. All deployed application code still comes from the repository's Docker build context.
 
-See [acceptance coverage](docs/acceptance.md) and [execution evidence](docs/implementation.md). Fault hooks and shortened timings require explicit `TEST_MODE=true` and are inactive in ordinary deployment. Tests use immutable payload `_test` controls for `fail_first` (first N lifetime attempts), `permanent`, real-second `delay` (null uses the normal delay), and `pause_at`; these are rejected in ordinary mode. `pause_at` self-arms once per job/container at `after_reserve`, `after_publish`, `before_processing`, `during_execution`, or `after_final`, avoiding a race between dispatch and external hook installation. Test-only pause files also target status commit/ack and reaper polling. They pause the real path and never replace database or broker operations.
+See [acceptance coverage](docs/acceptance.md) and [execution evidence](docs/implementation.md). Fault hooks and shortened timings require explicit `TEST_MODE=true` and are inactive in ordinary deployment. Tests use immutable payload `_test` controls for `fail_first` (first N lifetime attempts), `permanent`, real-second `delay` (null uses the normal delay), and `pause_at`; these are rejected in ordinary mode. `pause_at` self-arms once per job/container at `after_reserve`, `after_publish`, `before_processing`, `during_execution`, `after_outcome_saved`, or `after_final`, avoiding a race between dispatch and external hook installation. Test-only pause files also target status commit/ack and reaper polling. They pause the real path and never replace database or broker operations.
 
 ## Configuration
 
-Credentials: `DATABASE_URL` and `API_TOKEN` belong only to API; `BROKER_URL` belongs to both. Compose builds URLs from `.env` credentials. Other defaults:
+Compose reads credentials and the optional API port from `.env`. The `${NAME}` entries insert those values; `:?` reports a missing required value, and `:-8000` supplies a default port. `DATABASE_URL` and `API_TOKEN` belong only to API; `BROKER_URL` belongs to both. Workers alone receive `REDIS_URL` (default `redis://redis:6379/0`) and `EXECUTION_NAMESPACE` (default `bifrost:worker`). All replicas of a service must use the same namespace. Redis connection failures pause consumption rather than executing without a claim.
+
+Application defaults live in `bifrost/config.py`. To change one, add it to the relevant service's `environment` in `compose.yaml`. The E2E runner adds `compose.test.yaml`, which enables test mode, sets faster timings, and exposes the broker on temporary loopback ports.
 
 | Variable | Default | Purpose |
 |---|---:|---|

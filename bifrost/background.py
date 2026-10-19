@@ -8,7 +8,7 @@ from bifrost.broker import deliveries, publish, topology
 from bifrost.config import Settings
 from bifrost.lifecycle import begin, failure, matches_current_attempt
 from bifrost.models import DispatchIdentity, Event, Failure, Work, utcnow
-from bifrost.runtime import pause
+from bifrost.runtime import pause_for_test
 from bifrost.store import change, recover_publication, reserve
 
 log = logging.getLogger("status")
@@ -27,18 +27,22 @@ def work_message(row):
     )
 
 
-async def dispatch(pool, channel, config: Settings):
+async def dispatch(pool, channel, config: Settings, stop: asyncio.Event):
     for _ in range(50):
+        if stop.is_set():
+            break
         row = await recover_publication(pool, config)
         recovering = row is not None
         if row is None:
+            if stop.is_set():
+                break
             row = await reserve(pool, config)
         if row is None:
             break
         if not recovering:
-            await pause("after_reserve", row["id"], row["payload"])
+            await pause_for_test("after_reserve", row["id"], row["payload"])
         await publish(channel, "q.jobs", work_message(row), row["priority"])
-        await pause("after_publish", row["id"], row["payload"])
+        await pause_for_test("after_publish", row["id"], row["payload"])
         await pool.execute(
             """
             UPDATE jobs SET publish_confirmed=true
@@ -78,7 +82,7 @@ async def apply_event(pool, event: Event, config: Settings):
         elif event.event == "failed":
             assert event.error is not None  # Event validation requires failure data.
             await failure(connection, row, event.error, config)
-        await pause("before_status_commit", event.job_id)
+        await pause_for_test("before_status_commit", event.job_id)
 
 
 async def statuses(pool, broker, config: Settings, stop):
@@ -96,12 +100,12 @@ async def statuses(pool, broker, config: Settings, stop):
                     await message.reject(requeue=False)
                     continue
                 await apply_event(pool, event, config)
-                await pause("after_status_commit", event.job_id)
+                await pause_for_test("after_status_commit", event.job_id)
                 await message.ack()
 
 
 async def reap(pool, config: Settings):
-    await pause("reaper_tick", "reaper")
+    await pause_for_test("reaper_tick", "reaper")
     for _ in range(50):
         async with pool.acquire() as connection, connection.transaction():
             row = await connection.fetchrow(

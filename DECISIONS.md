@@ -56,7 +56,7 @@ Manual retry preserves payload and history, resets current output/error/progress
 
 ## 5. Database Ownership and Worker Coupling
 
-**Choice:** The API service owns all Postgres access, including scheduling, status updates, recovery, logs, and cleanup. Workers have no DATABASE_URL. They communicate through RabbitMQ without an HTTP execution-admission handshake.
+**Choice:** The API service owns all Postgres access, including scheduling, status updates, recovery, logs, and cleanup. Workers have no DATABASE_URL. They communicate through RabbitMQ without an HTTP execution-admission handshake. Workers own a small Redis execution registry on a separate internal network; the API has no Redis configuration or network access. See decision 18.
 
 **Why:** Workers depend on the message contract rather than the database schema and credentials.
 
@@ -66,9 +66,9 @@ Manual retry preserves payload and history, resets current output/error/progress
 
 **Choice:** Use durable messages, publisher confirmations, competing work consumers, and manual acknowledgements with one outstanding work delivery per worker. Confirm processing publication before running the handler; confirm final-outcome publication before acknowledging work. Business failures are acknowledged after their failure event is confirmed.
 
-**Guarantee:** At-least-once execution with guarded database state. RabbitMQ normally assigns an outstanding delivery to one consumer, but connection loss can trigger redelivery while the old process is still executing. Uncertain publication can also produce duplicate messages. Publisher confirmation means broker acceptance, not that the API applied the event. See [RabbitMQ acknowledgements](https://www.rabbitmq.com/docs/confirms).
+**Guarantee:** At-least-once delivery with guarded database state. Worker-owned Redis claims suppress duplicate execution of the same logical attempt while its lease is valid; saved outcomes are replayed without rerunning handlers for 24 hours. Connection loss and uncertain publication can still produce duplicate messages. Publisher confirmation means broker acceptance, not that the API applied the event. See [RabbitMQ acknowledgements](https://www.rabbitmq.com/docs/confirms).
 
-**Tradeoff:** Tokens prevent stale state updates, not repeated side effects. There is no exactly-once claim or general execution-deduplication service. Real external effects would need handler-specific idempotency.
+**Tradeoff:** Dispatch tokens identify logical attempts, and Redis owner IDs distinguish physical claimants. An expired lease, lost Redis data, an expired saved outcome, or a different business attempt can still permit repeated effects. There is no exactly-once claim. Real external effects need handler-specific idempotency.
 
 ## 7. Cancellation Cutoff and Scheduling
 
@@ -157,3 +157,24 @@ Priority tests queue work before enabling consumption. Crash tests allow broker 
 Before connecting real external effects, define idempotency for each handler and test the failure between performing the effect and reporting completion. For example, an external service that accepts an idempotency key can use the job ID to prevent duplicate effects.
 
 The exercise deliberately stops at mock handlers and guarded job state. Adding more queue machinery alone would not make real side effects exactly once.
+
+## 18. Worker-Owned Execution Claims in Redis
+
+**Problem:** A recovered publication can put the same dispatch in RabbitMQ twice. Previously both workers executed it and could report conflicting results; the first final event accepted by the API won. A dispatch token protects job state, but does not select one physical executor.
+
+**Choice:** Add one Redis container, one concrete adapter (`execution_store.py`), and one execution service (`execution.py`). Keep Postgres private to the API and communicate between services only through RabbitMQ. No API polling, admission RPC, new Postgres database, generic storage framework, or separate coordinator service is needed.
+
+The key is `bifrost:worker:{type}:{claim_token}:{job_id}`. `EXECUTION_NAMESPACE` is a stable service prefix shared by all its replicas, never a container hostname. Including the token lets automatic and manual business retries run under new keys instead of replaying a previous attempt's failure.
+
+1. `SET ... NX PX` claims a missing key with a fresh `claimed:{owner_uuid}` value. Its lease is the handler timeout plus 15 seconds for processing publication and saving the outcome. There are no heartbeats.
+2. A duplicate waits on Redis with its broker delivery still unacknowledged. It either observes the saved outcome or claims the key after the dead owner's lease expires. Waiting observes worker shutdown; it does not busy-requeue into RabbitMQ's delivery limit.
+3. The owner publishes processing and runs the bounded handler. A short Lua compare-and-set replaces its own claim with the final Event JSON, retained for 24 hours. An expired owner cannot overwrite a successor's claim or saved outcome, and cannot publish its unsaved result.
+4. The worker publishes that recorded event with confirmation, then acknowledges work. Redelivery after saving or publication replays the same recorded outcome without another execution. Both success and failure outcomes are retained; progress is not cached.
+
+Redis uses a named volume, AOF with `appendfsync always`, and `noeviction`. The extra fsync cost is acceptable for two small writes per mock execution. Redis has no host port and joins only the worker execution network. Connection failures stop execution and close the broker channel so unacknowledged work can return. Before reopening broker consumption, the worker checks Redis connectivity, avoiding repeated redeliveries during a prolonged outage. The API's health endpoint still measures its own dependencies and reports missing worker consumers as degraded; it does not probe the worker's private Redis.
+
+**Why Redis:** This is temporary coordination and outcome replay, not another relational domain model. Redis provides an atomic expiring claim with little code. Saving the outcome matters: deleting a lock immediately after success would let a redelivered message execute again. The Lua comparison matters: an old owner must not overwrite a newer owner after expiry. These follow Redis's [SET semantics](https://redis.io/docs/latest/commands/set/) and [single-instance lease guidance](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/).
+
+**On actual services:** Email service replicas would share an email-service namespace/store; report service replicas would share their own. Each service owns its execution records and credentials. Independent services do not read each other's business tables or the job API's database. Separate Redis deployments or prefix-scoped ACLs can enforce this boundary; a prefix by itself is not authorization.
+
+**Limits:** This is one Redis instance, not a high-availability lock system. Lease expiry permits takeover even if an old process is still running. The claim is per logical attempt, not across all future attempts of a job. The API remains the retry/reaper authority: delayed status application can abandon an attempt and issue a new token even if its old execution succeeded. A crash after an external effect but before saving the outcome is still ambiguous. Real email/webhook integrations must use a stable operation key such as job ID at an idempotent receiver, or reconcile unknown outcomes. Redis claims reduce duplicate execution; they do not make arbitrary effects exactly once.

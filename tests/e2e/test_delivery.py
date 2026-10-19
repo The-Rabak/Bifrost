@@ -197,7 +197,9 @@ def test_status_commit_ack_crash_keeps_atomic_history(api, stopped_workers, poin
     ]
 
 
-@pytest.mark.parametrize("point", ["before_processing", "after_final", "during_execution"])
+@pytest.mark.parametrize(
+    "point", ["before_processing", "after_outcome_saved", "after_final", "during_execution"]
+)
 def test_worker_crash_redelivery_keeps_logical_attempt(api, point):
     # Redelivery and reaping are separate mechanisms; this case isolates redelivery.
     hook("api", "reaper_tick", "reaper")
@@ -227,8 +229,11 @@ def test_worker_crash_redelivery_keeps_logical_attempt(api, point):
                 job_id in line and "work_acknowledged" in line for line in text.splitlines()
             ),
         )
-        if point != "before_processing":
+        if point == "during_execution":
             assert len([r for r in executions() if r["job_id"] == job_id]) >= 2
+        else:
+            # A saved outcome is replayed after a crash, without another handler invocation.
+            assert len([r for r in executions() if r["job_id"] == job_id]) == 1
     finally:
         unhook("api", "reaper_tick")
         unhook("worker", point)
@@ -344,6 +349,7 @@ def test_multiple_workers_and_apis_normal_delivery_and_status_failover(api):
                 lambda: management("consumers/%2F"),
                 lambda entries: (
                     len([e for e in entries if e["queue"]["name"] == "q.job-status"]) == 1
+                    and any(e["active"] for e in entries if e["queue"]["name"] == "q.job-status")
                 ),
             )
             assert next(e for e in remaining if e["queue"]["name"] == "q.job-status")["active"]
@@ -378,6 +384,10 @@ def test_invalid_current_token_events_do_not_start_or_mutate_job(api, stopped_wo
         {"event": "progress"},
         {"event": "progress", "progress": 101},
         {"event": "unknown"},
+        {"event": "completed", "result": {"nested": ["nul\0value"]}},
+        {"event": "completed", "result": {"nested": {"nul\0key": "value"}}},
+        {"event": "failed", "error": {"code": "nul\0code", "message": "bad", "transient": False}},
+        {"event": "failed", "error": {"code": "bad", "message": "nul\0text", "transient": False}},
     ]:
         inject("q.job-status", {**base, **event})
     inject(

@@ -1,7 +1,27 @@
-# Used only by the isolated E2E runner, for real broker observation/injection from the host.
+# Used only by the isolated E2E runner: faster timings and host access to the broker.
 services:
+  api:
+    environment:
+      TEST_MODE: 'true'
+      TIME_SCALE: '0.02'
+      RETRY_BASE: '0.15'
+      TICK_SECONDS: '0.08'
+      RECOVERY_SECONDS: '5'
+      REAPER_SECONDS: '0.1'
+      RECOVERY_ALLOWANCE: '5'
+      CLEANUP_SECONDS: '0.2'
+      SUBMIT_LIMIT: '10000'
+  worker:
+    environment:
+      TEST_MODE: 'true'
+      TIME_SCALE: '0.02'
+      RETRY_BASE: '0.15'
   broker:
-    networks: [internal, edge]
-    ports: ['127.0.0.1::5672', '127.0.0.1::15672']
+    networks:
+      - internal
+      - edge
+    ports:
+      - '127.0.0.1::5672'
+      - '127.0.0.1::15672'
     environment:
       RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: '+S 2:2 +A 4 -rabbit collect_statistics_interval 1000'

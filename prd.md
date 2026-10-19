@@ -1,8 +1,13 @@
 # PRD: Distributed Job Queue Service
 
-**Version:** 1.1  
-**Status:** Design agreed; ready for execution planning  
-**Stack:** Python 3.11+ / FastAPI / Postgres 16 / RabbitMQ 4.3 / Docker Compose  
+**Execution update (2026-10-20):** Workers now own a small Redis execution registry, without access to API Postgres or API polling. Expiring owner claims suppress concurrent handling of the same dispatch, and saved outcomes replay for 24 hours without another handler invocation. Business retries use new dispatch keys. Lease expiry, Redis data loss, different attempts, and effects before outcome persistence remain outside the duplicate-suppression guarantee. This supersedes earlier unqualified statements that every work redelivery may execute again. Concrete behavior and rationale are in [DECISIONS.md, decision 18](DECISIONS.md#18-worker-owned-execution-claims-in-redis).
+
+**Version:** 1.2
+
+**Status:** Implemented; worker-owned Redis execution coordination added
+
+**Stack:** Python 3.11+ / FastAPI / Postgres 16 / RabbitMQ 4.3 / Redis 7.4 / Docker Compose
+
 **Goal:** A small, secure background job system that demonstrates correct normal work distribution, durable state, and understandable crash/restart recovery.
 
 ## 1. Overview and Goals
@@ -18,7 +23,7 @@ This is an engineering assessment, not a production platform. Prefer the simples
 * Lifecycle: scheduled, pending, dispatched, processing, completed, failed, cancelled.
 * Automatic retry with exponential backoff and one permitted manual retry cycle per job.
 * Cancellation before dispatch.
-* Multiple database-free workers consuming one shared work queue.
+* Multiple Postgres-free workers consuming one shared work queue, with worker-owned Redis execution claims.
 * Worker execution timeouts, crash recovery, and ordinary service restart recovery.
 * Batch progress, structured logs, audit history, and modest best-effort cleanup.
 * A fixed shared API bearer token, basic rate limiting, and dependency/queue health reporting.
@@ -30,7 +35,7 @@ This is an engineering assessment, not a production platform. Prefer the simples
 * Real email delivery, outbound webhook calls, report storage, or other external side effects.
 * Workflows/DAGs, cron, per-tenant isolation, user accounts, JWTs, or authorization scopes.
 * Cancellation after dispatch, execution-admission RPCs, or worker access to Postgres.
-* Exactly-once execution, a general execution-deduplication service, or a separate outbox subsystem.
+* Exactly-once execution, a separate cross-service execution coordinator, or a separate outbox subsystem.
 * Heartbeat infrastructure, automated DLQ replay, priority aging, or fairness guarantees.
 * Database sharding/partitioning, broker clustering, production high availability, or production-grade retention.
 
@@ -71,7 +76,7 @@ flowchart TD
 
 Use one durable quorum work queue, q.jobs, one durable status queue, q.job-status, and one work dead-letter queue, q.jobs.dlq, reached through dlx.jobs. Do not create separate work queues or worker services for each type.
 
-Every worker runs the same image and supports all four handlers. Workers have RabbitMQ credentials but no DATABASE_URL or direct database access. An HTTP execution-admission handshake is not required.
+Every worker runs the same image and supports all four handlers. Workers have RabbitMQ credentials but no DATABASE_URL or access to the API Postgres. They own a Redis execution registry on a separate internal network. An HTTP execution-admission handshake is not required.
 
 If multiple API replicas are run, their schedulers use atomic database claims. Only one status consumer is active at a time; RabbitMQ Single Active Consumer provides status-consumer selection and failover. Work consumers remain ordinary competing consumers so multiple workers can execute different jobs concurrently.
 
@@ -354,7 +359,7 @@ Before abandoning an attempt, re-check its current state, token, and expiry atom
 | API dies after reservation but before work publication is confirmed/recorded | Recover the outstanding dispatch from Postgres and republish with the same token. |
 | Worker dies before processing publication | RabbitMQ can redeliver the unacknowledged work; no logical attempt has yet been counted. |
 | Worker dies after processing but before final outcome | RabbitMQ may redeliver the same attempt first; otherwise the reaper abandons the stale attempt and applies the retry budget. |
-| Worker dies after final publication but before work acknowledgement | Work may redeliver and execute again; guarded status updates preserve the accepted outcome. |
+| Worker dies after saving its outcome or final publication but before work acknowledgement | Work redelivery replays the Redis-recorded outcome without executing again while retained; guarded status updates preserve the accepted outcome. |
 | Status consumer dies | Unacknowledged status messages redeliver; transactional state/log writes prevent partially applied transitions. |
 | API, worker, or broker ordinarily restarts | Persisted jobs and durable broker messages remain available; reconnect/recovery resumes processing. |
 
@@ -456,7 +461,7 @@ These files are submission deliverables to produce during execution; this PRD re
 
 The next session should turn this agreed design into concrete vertical execution slices. It should define database migrations/queries, message schemas and consumer mechanics, module/file ownership, dependency configuration, deployment commands, and focused evidence for each slice.
 
-Keep the agreed simplifications: database-free workers, three queues serving distinct roles, job-row dispatch recovery, one active status consumer, bounded mock execution, and explicit failure tradeoffs. Do not add production subsystems simply to remove limitations already accepted here.
+Keep the agreed simplifications: workers without API-database access, three queues serving distinct roles, job-row dispatch recovery, one active status consumer, bounded mock execution, and explicit failure tradeoffs. Do not add production subsystems simply to remove limitations already accepted here.
 
 ### Source references
 

@@ -190,8 +190,13 @@ def test_container_security_and_repeatable_initialization(api):
 
     config = json.loads(configuration)
     assert "DATABASE_URL" not in config["services"]["worker"]["environment"]
+    assert "REDIS_URL" not in config["services"]["api"]["environment"]
     assert not config["services"]["db"].get("ports")
     assert not config["services"]["broker"].get("ports")
+    assert not config["services"]["redis"].get("ports")
+    assert not (
+        set(config["services"]["redis"]["networks"]) & set(config["services"]["api"]["networks"])
+    )
     compose("restart", "api")
     ready(api, consumers=1)
     assert finished(api, submit(api))["total_attempts"] == 1
@@ -279,3 +284,46 @@ def test_graceful_api_shutdown_finishes_active_status_transaction_and_acknowledg
         "processing",
         "completed",
     ]
+
+
+def test_graceful_api_shutdown_finishes_reserved_handoff_and_leaves_backlog(api, stopped_workers):
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+
+    from conftest import reached, unhook
+
+    ready(api, consumers=0)
+    first = submit(api, payload={"to": "a@example.com", "_test": {"pause_at": "after_reserve"}})
+    eventually(lambda: reached("api", "after_reserve", first), bool)
+    backlog = [submit(api) for _ in range(3)]
+    assert all(job(api, identifier)["status"] == "pending" for identifier in backlog)
+    since = datetime.now(UTC).isoformat()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            stopping = pool.submit(compose, "stop", "-t", "10", "api")
+            try:
+                eventually(
+                    lambda: compose("logs", "--since", since, "--no-color", "api").stdout,
+                    lambda output: "Waiting for application shutdown" in output,
+                )
+            finally:
+                unhook("api", "after_reserve")
+            stopping.result(timeout=15)
+        identifier = compose("ps", "-aq", "api").stdout.strip()
+        state = json.loads(subprocess.check_output(["docker", "inspect", identifier]))[0]["State"]
+        assert state["ExitCode"] == 0, state
+        eventually(
+            lambda: management("queues/%2F/q.jobs")["messages_ready"],
+            lambda count: count == 1,
+        )
+        output = compose("logs", "--no-color", "api").stdout
+        assert not any(
+            '"message": "dispatched"' in line and any(job_id in line for job_id in backlog)
+            for line in output.splitlines()
+        )
+    finally:
+        compose("start", "api")
+        ready(api, consumers=0)
+    compose("start", "worker")
+    for job_id in [first, *backlog]:
+        assert finished(api, job_id)["total_attempts"] == 1

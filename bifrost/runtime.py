@@ -8,6 +8,8 @@ from pathlib import Path
 
 import asyncpg
 from aio_pika.exceptions import AMQPException, ChannelInvalidStateError, ChannelPreconditionFailed
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from bifrost.config import settings
 
@@ -21,6 +23,8 @@ DEPENDENCY_ERRORS = (
     asyncpg.ConnectionDoesNotExistError,
     asyncpg.AdminShutdownError,
     asyncpg.CrashShutdownError,
+    RedisConnectionError,
+    RedisTimeoutError,
 )
 
 
@@ -60,28 +64,53 @@ def dependency_failure(error: Exception) -> bool:
     )
 
 
-def hook_directive(gate: Path, marker: Path, job_id, automatic: bool):
-    # Restart/redelivery can proceed after release without arming the same pause again.
-    if automatic and not marker.exists():
-        gate.write_text(str(job_id))
-    return gate.read_text().strip() if gate.exists() else None
+def _read_pause_command(
+    pause_file: Path, reached_file: Path, job_id: str, requested_by_job: bool
+) -> str | None:
+    """Create a job-requested pause once, then read the test's command."""
+    # The marker survives container restart. Once released, the same job must not
+    # recreate its pause when RabbitMQ redelivers it or the API recovers it.
+    if requested_by_job and not reached_file.exists():
+        pause_file.write_text(job_id)
+
+    if not pause_file.exists():
+        return None
+    return pause_file.read_text().strip()
 
 
-async def pause(point: str, job_id, payload: dict | None = None):
+async def pause_for_test(point: str, job_id, payload: dict | None = None):
+    """Wait at a test breakpoint until the external test deletes its pause file.
+
+    The pause file contains a job ID, '*' for any job, or 'raise' to inject an
+    error. A separate reached file tells the test execution got this far.
+    Jobs can request their own breakpoint with payload._test.pause_at.
+    """
     if not settings().test_mode:
         return
-    gate = Path(f"/tmp/hook-{point}")
-    marker = Path(f"/tmp/reached-{point}-{job_id}")
-    automatic = (payload or {}).get("_test", {}).get("pause_at") == point
-    directive = await asyncio.to_thread(hook_directive, gate, marker, job_id, automatic)
-    if directive not in ("*", str(job_id), "raise"):
+
+    job_id = str(job_id)
+    pause_file = Path(f"/tmp/hook-{point}")
+    reached_file = Path(f"/tmp/reached-{point}-{job_id}")
+    test_controls = payload.get("_test", {}) if payload else {}
+    requested_by_job = test_controls.get("pause_at") == point
+
+    # File operations run in a thread so they do not block the asyncio event loop.
+    command = await asyncio.to_thread(
+        _read_pause_command, pause_file, reached_file, job_id, requested_by_job
+    )
+    if command is None:
         return
-    await asyncio.to_thread(marker.touch)
-    logging.getLogger("fault-hook").info(point, extra={"context": {"job_id": str(job_id)}})
-    if directive == "raise":
+    if command != job_id and command not in ("*", "raise"):
+        return
+
+    await asyncio.to_thread(reached_file.touch)
+    logging.getLogger("fault-hook").info(point, extra={"context": {"job_id": job_id}})
+    if command == "raise":
         raise RuntimeError(f"Test-injected programming error at {point}")
-    # The external test process removes the gate; no in-process event can signal it.
-    while await asyncio.to_thread(gate.exists):  # noqa: ASYNC110
+
+    # Only this coroutine waits; HTTP requests and other background tasks keep
+    # running. The host test releases it by deleting the file via docker exec.
+    while await asyncio.to_thread(pause_file.exists):  # noqa: ASYNC110
         await asyncio.sleep(0.05)
 
 

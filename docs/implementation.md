@@ -56,3 +56,39 @@ Additional hostile-input tracers reproduced a nullable batch-delay crash (`bifro
 - Static verification: `uv run ruff format --check bifrost tests scripts`, `uv run ruff check bifrost tests scripts`, and `uv run ty check bifrost` all passed.
 
 Local evidence is retained under `artifacts/bifrost-test-9f92249d/`: `build.json`, `images.json`, `results.xml`, `stack.log`, and `execution.log`. Generated artifacts and credentials are excluded from Git; the runner reproduces the acceptance evidence. [acceptance.md](acceptance.md) provides the requirement mapping and [review.md](review.md) records the separate standards/spec review. No required acceptance case remains skipped or unverified; the limitations are the specification's accepted operational boundaries.
+
+## Review follow-up
+
+The review supplied reproductions for NUL admission/status poisoning, submission nesting that exceeded the worker JSON parser's envelope budget, dispatch continuing to reserve after shutdown, and diagnostics failures bypassing runner teardown. Shared JSON validation now rejects NUL keys/values and limits nesting to 64 object/array containers, safely below the broker parser's limit after adding Work/Event envelopes. Idempotency keys and failure text also reject NUL. Dispatch observes the lifespan stop event before taking another reservation, while completing a handoff already in progress. Runner teardown is in a nested `finally`; diagnostic failures still produce a nonzero exit.
+
+Focused host-runner tests passed all four cases: log timeout, stack-log write failure, report-redaction write failure, and successful diagnostics. These simulate failures of the host filesystem/subprocess interfaces, not application behavior. Ruff lint, formatting, and `ty check bifrost` passed.
+
+The first review run, `bifrost-test-9ef6e239`, finished with **73 passed, 1 failed in 503.01 seconds**, test exit 1 and cleanup exit 0. All new validation and shutdown regressions passed. The existing replica-failover case completed a job through the sole surviving API, then observed a sampled management response with one consumer still marked inactive. Its poll previously waited only for consumer removal and asserted activity on that first response. The bounded poll now requires both one remaining consumer and its active flag; the activity assertion and actual completion requirement remain intact. A new complete run follows this fix; the failed run is retained as diagnostic evidence.
+
+**Review completion gate passed:** `UV_PROJECT_ENVIRONMENT=/tmp/bifrost-venv uv run python scripts/e2e.py`.
+
+- Project: `bifrost-test-867afc4c`, with fresh isolated volumes.
+- Result: **74 passed in 548.98 seconds**, zero failures, errors, or skips. Test exit 0; cleanup exit 0. All project containers, volumes, and networks were removed.
+- Tested source SHA-256: `056fd1c8fce48ff1173bdfde051c30d722e67b0a5d88ee6583b75843c34052e1`, verified unchanged after the run. Base revision: `c775cabe0ae3de8cac6f4a3e5bac4b86b80b4c1f` plus the review fixes.
+- API image: `sha256:56c0ffaf6b6f228c9e3fa3481d004d02ae885584e1127a853ebfecfe8588ead3`; worker image: `sha256:10c27f748bd16c737caa2e8adfd058405cea79fff8ba2024a378d249b84e961d`.
+- Supporting runner tests: **4 passed** using `UV_PROJECT_ENVIRONMENT=/tmp/bifrost-venv uv run pytest tests/runner -q`. Ruff lint/format checks and `ty check bifrost` passed on the final source.
+
+Evidence is retained in `artifacts/bifrost-test-867afc4c/`: `build.json`, `images.json`, `results.xml`, `stack.log`, and `execution.log`. The first review run's failure and cleanup diagnostics remain in its separate artifact directory.
+
+## Redis execution coordination (2026-10-20)
+
+The interview review changed the stateless-worker choice: workers now own Redis claims and retained final outcomes. Postgres remains private to the API. The Redis adapter contains the atomic claim and owner-checked outcome save; the execution service contains waiting, timeout/failure handling, and replay. Compose adds Redis 7.4 with a named AOF volume, fsync on every write, no eviction, and a worker-only internal network. Decision 18 records the rationale, namespace layout, actual-service ownership, and remaining effect/recovery limits.
+
+Behavioral red: the new deployed replay test in `bifrost-test-555ef2d8` failed because two handler executions were observed after replaying one completed delivery. No application imports or dependency mocks were used.
+
+Focused green: `uv run python scripts/e2e.py tests/e2e/test_execution.py tests/e2e/test_delivery.py::test_worker_crash_redelivery_keeps_logical_attempt tests/e2e/test_lifecycle.py::test_manual_retry_race_grants_one_cycle_and_preserves_history -x` passed **10 tests in 73.77 seconds**, with cleanup exit 0 (`bifrost-test-e65d2986`). This includes saved success/failure replay, competing replicas, forced Redis restart, Redis outage recovery, worker crash boundaries, and manual retry. A subsequent full run was deliberately interrupted to correct the Redis async retry-class import; it is not counted as passing evidence. The final complete gate below uses rebuilt images after that correction and includes an adversarial expired-owner test and Redis network-isolation assertions.
+
+**Redis completion gate passed:** `PATH=/mnt/wsl/docker-desktop/cli-tools/usr/bin:$PATH UV_PROJECT_ENVIRONMENT=/tmp/bifrost-venv uv run python scripts/e2e.py`. The PATH override selects this host's Linux Docker Desktop client; the documented command remains `uv run python scripts/e2e.py` with Docker configured on PATH.
+
+- Project: `bifrost-test-2c3baf56`, with fresh isolated Postgres, RabbitMQ, and Redis volumes.
+- Result: **81 passed in 577.65 seconds**, zero failures, errors, or skips. Test exit 0; cleanup exit 0. The runner removed its containers, volumes, networks, and application image tags.
+- Tested source SHA-256: `16fbe8be0bb11672c8978ac1ec4e893c6ae258ef7adaca1c486555dcb33207cf`; independently recomputed and unchanged after the run. Base revision: `c775cabe0ae3de8cac6f4a3e5bac4b86b80b4c1f` plus the working-tree changes.
+- API image: `sha256:3e3708b496757afec99032ea5284f019156ab27f08d0326555abeecb94167956`; worker image: `sha256:43a050c49090bb14de8a03fc716ce187c711efbc0622bded43734de093ff2e96` (inspected before teardown).
+- Supporting host-runner tests: **4 passed**. Ruff lint/format checks, `ty check bifrost`, and CRLF-aware diff whitespace checks passed.
+
+Local evidence: `artifacts/bifrost-test-2c3baf56/build.json`, `results.xml`, and redacted `stack.log`. The source manifest and JUnit report establish the exact tested source and complete scenario results; generated artifacts remain ignored.

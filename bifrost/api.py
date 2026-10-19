@@ -43,7 +43,10 @@ async def lifespan(app: FastAPI):
     tasks = [
         asyncio.create_task(
             supervise(
-                "scheduler", lambda: dispatch(pool, channel, config), stop, config.tick_seconds
+                "scheduler",
+                lambda: dispatch(pool, channel, config, stop),
+                stop,
+                config.tick_seconds,
             )
         ),
         asyncio.create_task(

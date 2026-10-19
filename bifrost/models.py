@@ -38,9 +38,32 @@ class Status(StrEnum):
 
 TERMINAL = {Status.completed, Status.failed, Status.cancelled}
 TIMEOUTS = {JobType.email: 15, JobType.webhook: 15, JobType.report: 60, JobType.batch: 180}
+# Leave ample room for Work/Event envelopes below the broker JSON parser's recursion limit.
+MAX_JSON_DEPTH = 64
+
+
+def reject_nul(value: str) -> str:
+    if "\0" in value:
+        raise ValueError("NUL characters are not supported")
+    return value
 
 
 def encode_json(value) -> str:
+    pending = [(value, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if isinstance(item, str):
+            reject_nul(item)
+        elif isinstance(item, (dict, list)):
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise ValueError(f"JSON nesting exceeds {MAX_JSON_DEPTH} containers")
+            if isinstance(item, dict):
+                for key in item:
+                    reject_nul(key)
+                pending.extend((child, depth) for child in item.values())
+            else:
+                pending.extend((child, depth) for child in item)
     return json.dumps(value, allow_nan=False)
 
 
@@ -54,7 +77,12 @@ class MockControls(StrictModel):
     delay: Annotated[float, Field(ge=0, le=200)] | None = None
     pause_at: (
         Literal[
-            "after_reserve", "after_publish", "before_processing", "during_execution", "after_final"
+            "after_reserve",
+            "after_publish",
+            "before_processing",
+            "during_execution",
+            "after_outcome_saved",
+            "after_final",
         ]
         | None
     ) = None
@@ -108,6 +136,11 @@ class Submission(StrictModel):
     scheduled_for: AwareDatetime | None = None
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
 
+    @field_validator("idempotency_key")
+    @classmethod
+    def valid_key(cls, value):
+        return reject_nul(value) if value is not None else None
+
     @field_validator("payload")
     @classmethod
     def validate_payload(cls, value, info: ValidationInfo):
@@ -146,6 +179,11 @@ class Failure(StrictModel):
     code: str = Field(min_length=1, max_length=100)
     message: str = Field(min_length=1, max_length=2000)
     transient: Annotated[bool, Field(strict=True)]
+
+    @field_validator("code", "message")
+    @classmethod
+    def valid_text(cls, value):
+        return reject_nul(value)
 
 
 class Event(DispatchIdentity):

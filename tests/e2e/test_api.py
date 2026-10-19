@@ -12,6 +12,7 @@ def test_submit_and_complete_all_handlers(api):
         ("batch", {"items": ["a", "b"]}, "processed_count"),
         ("batch", {"items": []}, "summary"),
         ("batch", {"items": ["nullable"], "_test": {"delay": None}}, "processed_count"),
+        ("batch", {"items": [r"\u0000", {r"\u0000": "literal"}]}, "summary"),
     ]
     for kind, payload, result_key in cases:
         job_id = submit(api, kind, payload)
@@ -58,6 +59,14 @@ def test_submit_and_complete_all_handlers(api):
         {"max_attempts": 1.2},
         {"idempotency_key": ""},
         {"idempotency_key": "x" * 201},
+        {"idempotency_key": "nul\0key"},
+        {"payload": {"to": "a@example.com", "subject": "nul\0subject"}},
+        {"payload": {"to": "a@example.com", "body": "nul\0body"}},
+        {"type": "batch", "payload": {"items": [{"nested": ["nul\0value"]}]}},
+        {"type": "batch", "payload": {"items": [{"nul\0key": "value"}]}},
+        {"type": "webhook", "payload": {"url": "https://example.com", "data": {"x": "\0"}}},
+        {"type": "webhook", "payload": {"url": "https://example.com", "data": {"\0": "x"}}},
+        {"type": "report", "payload": {"parameters": {"nested": {"\0": "x"}}}},
         {"scheduled_for": "2030-01-01T00:00:00"},
         {"payload": {"to": "bad"}},
         {"payload": {"to": "a@example.com", "extra": 1}},
@@ -97,6 +106,25 @@ def test_authentication_and_collection_validation(api):
     for query in ["limit=101", "limit=0", "offset=-1", "status=nonsense", "type=bad"]:
         assert api.get("/jobs?" + query).status_code == 422
     assert api.get("/health", headers={"Authorization": ""}).status_code == 200
+
+
+@pytest.mark.parametrize("containers", [62, 63, 200])
+@pytest.mark.parametrize("shape", ["arrays", "objects", "mixed"])
+def test_json_nesting_boundary_survives_work_and_result_envelopes(api, containers, shape):
+    item = "leaf"
+    for index in range(containers):
+        item = {"child": item} if shape == "objects" or (shape == "mixed" and index % 2) else [item]
+    payload = {"items": [item]}
+    before = api.get("/jobs").json()["total"]
+    response = api.post("/jobs", json={"type": "batch", "payload": payload})
+    if containers > 62:  # Payload object and items array use the other two container levels.
+        assert response.status_code == 422, response.text
+        assert api.get("/jobs").json()["total"] == before
+    else:
+        assert response.status_code == 202, response.text
+        result = finished(api, response.json()["id"])
+        assert result["total_attempts"] == 1
+        assert result["result"] == {"processed_count": 1, "summary": [item]}
 
 
 def test_pagination_filtering_and_defaults(api):

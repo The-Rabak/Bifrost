@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     management_url: str = "http://broker:15672"
     broker_user: str = ""
     broker_password: str = ""
+    redis_url: str = "redis://redis:6379/0"
+    execution_namespace: str = Field(default="bifrost:worker", min_length=1)
     test_mode: bool = False
     time_scale: float = Field(default=1, gt=0, le=1)
     retry_base: float = Field(default=30, gt=0)
